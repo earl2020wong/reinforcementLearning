@@ -1,3 +1,4 @@
+#gymnasium is a community maintained fork of openAI gym.  
 import gymnasium as gym 
 import time
 
@@ -6,10 +7,11 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-env = gym.make("LunarLander-v3") #, render_mode="human")
 
 
-print("Continuous Obsevation space shape: ", env.observation_space.shape[0])
+env = gym.make("LunarLander-v3", render_mode="human")
+
+print("Continuous Observation space shape: ", env.observation_space.shape[0])
 print("Observation space, Lower bounds: ", env.observation_space.low)
 print("Observation space, Upper bounds: ", env.observation_space.high)
 
@@ -28,17 +30,20 @@ for action in range(env.action_space.n):
 
 
 
-
-
 #hyperparameters 
 learning_rate = 1e-3
 gamma = 0.99
-num_episodes = 3000
+num_episodes = 2010
+
+
 
 class A2C_Actor(nn.Module):
 	def __init__(self, input_dim, output_dim):
 		super().__init__()
 
+		#dim=0 yields normalizing down the column
+		#dim=1 yields normalizing across the row
+		#dim=-1 yields normalizing the last dimension
 		self.net = nn.Sequential( 
 			nn.Linear(input_dim, 128),
 			nn.ReLU(),
@@ -59,16 +64,22 @@ class A2C_Critic(nn.Module):
 			nn.Linear(128, 1)
 		)
 
+	#squeeze() removes all dimensions of size 1
+	#squeeze(-1) removes the last dimension if it is size 1
+	#squeeze(0) removes the first dimension if it is size 1
 	def forward(self, x):
 		return self.net(x).squeeze(-1)
 
+
+
 def compute_returns(rewards, gamma):
 	returns = []
-	G = 0
+	G = 0.0 
 	for r in reversed(rewards):
 		G = r + gamma * G
 		returns.insert(0,G)
 	return returns
+
 
 
 #training loop
@@ -82,7 +93,8 @@ a2cCritic = A2C_Critic(observation_dim)
 optimA2CCritic = optim.Adam(a2cCritic.parameters(), lr=learning_rate) 
 
 
-resume_training = False
+
+resume_training = True
 if resume_training:
 	checkpoint = torch.load("a2c_mc_checkpoint.pth")
 	a2cActor.load_state_dict(checkpoint["actor_state_dict"])
@@ -97,12 +109,12 @@ else:
 for episode in range(start_episode, num_episodes):
 	log_probs = []
 	rewards = []
-	actions = []
 	values = []
-	values_next = []
-	advantageLoss = []
-	criticLoss = []
+	#advantages = []
+	actor_list = []
+	critic_list = []
 
+	#obs is a numpy array => torch.tensor(obs)
 	obs, _ = env.reset()
 	obs = torch.tensor(obs, dtype=torch.float32)
 
@@ -110,106 +122,78 @@ for episode in range(start_episode, num_episodes):
 	total_reward = 0.0
 
 	while not done: 
+		#action is not a pytorch tensor, but just an index
 		#action = env.action_space.sample()
 		
-		#obs_tensor = torch.tensor(obs, dtype=torch.float32)
+		#probs is 1D torch.tensor with n elements 
 		probs = a2cActor(obs)
+
+		#dist is not a tensor, but a distribution object
 		dist = torch.distributions.Categorical(probs)
+
+		#action is a pytorch scalar with value 0, 1, 2, ...
 		action = dist.sample()		
 
+		#log_prob is log of probability associated with selected softmax action / item 
+		#log_prob is a pytorch scalar	
 		log_probs.append(dist.log_prob(action))
 	
+		#reward is scalar => torch.tensor(reward); rewards is a list of scalars => torch.tensor(rewards)
 		obs_next, reward, terminated, truncated, info = env.step(action.item())
 		obs_next = torch.tensor(obs_next, dtype=torch.float32)
+
 		done = terminated or truncated 
 		total_reward += reward
 
-		#if episode % 10 == 0:
-            	#	env.render()
-
-		#time.sleep(0.05) 
-
 		#actor
 		rewards.append(reward)
-		actions.append(action)
 
-		
 		#critic
-		#with torch.no_grad():
-		value_next = a2cCritic(obs_next)
 		value = a2cCritic(obs)
-
-		values_next.append(value_next)
 		values.append(value)
-
-		target = reward + (1 - done) * gamma * value_next
-		#advantageLoss.append(target - value)
-		#detach() prevents gradients from propagating through 
-		critic_loss = (target - value).pow(2)
-		criticLoss.append(critic_loss)
 
 		obs = obs_next
 
-		#print(f"Episode {episode}, reward_received {reward:.2f}, action_taken {action}, total reward {total_reward:.2f}") 
-
-
-	#for i in range(len(rewards)):
-	#	print(f"Episode: {episode}, Iteration: {i}, Reward: {rewards[i]:.2f}, Action: {actions[i]}")
-
-
 	returns = compute_returns(rewards, gamma)
 	returns = torch.tensor(returns, dtype=torch.float32)
-	#returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+	returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+	
 	values = torch.stack(values) 
-	values_next = torch.stack(values_next)   
 
 	advantages = returns - values.detach()
+	#advantages with a smaller range can be more advantageous for learning
+	advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
 	
 	#print("advantages shape:", advantages.shape)
 	#print("returns shape:", returns.shape)
 	#print("values shape:", values.shape)
 	#print("values_next shape:", values_next.shape)
 
-
-	actorLoss2 = []
-	
 	#rPL = [-log_prob * G for log_prob, G in zip(log_probs, returns)]
 
 	for i in range(len(log_probs)):
 		log_prob = log_probs[i]
-		#G = torch.tensor(advantageLoss[i], dtype=torch.float32) #returns[i]
 		G = advantages[i] 
-		actor_loss = -log_prob * G
-		actorLoss2.append(actor_loss)
+		policy_gradient = -log_prob * G
+		actor_list.append(policy_gradient)
 
-	a2cActor_loss = torch.stack(actorLoss2, dim=0).mean()
+	a2cActor_estimate = torch.stack(actor_list, dim=0).mean()
 
 	optimA2CActor.zero_grad()
-	a2cActor_loss.backward()
+	a2cActor_estimate.backward()
 	optimA2CActor.step()
-
-
-	criticLoss2 = [];
 
 	for i in range(len(returns)):
 		critic_loss = (returns[i] - values[i]).pow(2)
-		criticLoss2.append(critic_loss)
+		critic_list.append(critic_loss)
 
-
-	criticLoss2 = torch.stack(criticLoss2, dim=0)
-	#print("criticLoss2 shape:", criticLoss2.shape)
-
-
-	a2cCritic_loss = criticLoss2.mean()
-	#criticLoss = torch.tensor(criticLoss, dtype=torch.float32)
-	#use stack so computational graph is not broken 
-	#a2cCritic_loss = torch.stack(criticLoss).mean()
+	a2cCritic_loss = torch.stack(critic_list, dim=0).mean()
 
 	optimA2CCritic.zero_grad()
 	a2cCritic_loss.backward()
 	optimA2CCritic.step()
 
-	print(f"Episode {episode}, reward_received {reward:.2f}, total reward {total_reward:.2f} criticLoss {a2cCritic_loss:.2f}")
+	print(f"Episode {episode}, reward_received {reward:.2f}, total reward {total_reward:.2f}, a2cActor_estimate {a2cActor_estimate:.5f}, a2cCritic_loss {a2cCritic_loss:.5f}")
 
 	checkpoint = {
     		"episode": episode,

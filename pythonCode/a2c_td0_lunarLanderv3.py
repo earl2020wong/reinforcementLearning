@@ -1,3 +1,4 @@
+#gymnasium is a community maintained fork of openAI gym.  
 import gymnasium as gym 
 import time
 
@@ -8,9 +9,9 @@ import numpy as np
 
 
 
-env = gym.make("LunarLander-v3") #, render_mode="human")
+env = gym.make("LunarLander-v3", render_mode="human")
 
-print("Continuous Obsevation space shape: ", env.observation_space.shape[0])
+print("Continuous Observation space shape: ", env.observation_space.shape[0])
 print("Observation space, Lower bounds: ", env.observation_space.low)
 print("Observation space, Upper bounds: ", env.observation_space.high)
 
@@ -32,7 +33,7 @@ for action in range(env.action_space.n):
 #hyperparameters 
 learning_rate = 1e-3
 gamma = 0.99
-num_episodes = 3010 
+num_episodes = 2015  
 
 
 
@@ -40,6 +41,9 @@ class A2C_Actor(nn.Module):
 	def __init__(self, input_dim, output_dim):
 		super().__init__()
 
+		#dim=0 yields normalizing down the column
+		#dim=1 yields normalizing across the row
+		#dim=-1 yields normalizing the last dimension
 		self.net = nn.Sequential( 
 			nn.Linear(input_dim, 128),
 			nn.ReLU(),
@@ -60,18 +64,11 @@ class A2C_Critic(nn.Module):
 			nn.Linear(128, 1)
 		)
 
+	#squeeze() removes all dimensions of size 1
+	#squeeze(-1) removes the last dimension if it is size 1
+	#squeeze(0) removes the first dimension if it is size 1
 	def forward(self, x):
 		return self.net(x).squeeze(-1)
-
-
-
-def compute_returns(rewards, gamma):
-	returns = []
-	G = 0
-	for r in reversed(rewards):
-		G = r + gamma * G
-		returns.insert(0,G)
-	return returns
 
 
 
@@ -87,7 +84,7 @@ optimA2CCritic = optim.Adam(a2cCritic.parameters(), lr=learning_rate)
 
 
 
-resume_training = False #True #False
+resume_training = True #False
 if resume_training:
 	checkpoint = torch.load("a2c_td0_checkpoint.pth")
 	a2cActor.load_state_dict(checkpoint["actor_state_dict"])
@@ -102,77 +99,89 @@ else:
 for episode in range(start_episode, num_episodes):
 	log_probs = []
 	rewards = []
-	actions = []
-	advantageLoss = []
-	criticLoss = []
+	advantages = []
+	actor_list = []
+	critic_list = []
 
+	#obs is a numpy array => torch.tensor(obs)
 	obs, _ = env.reset()
-	obs = torch.tensor(obs, dtype=torch.float32)
+	obs_tensor = torch.tensor(obs, dtype=torch.float32)
 
 	done = False
 	total_reward = 0.0
 
 	while not done: 
-		#action = env.action_space.sample()		
-		#obs_tensor = torch.tensor(obs, dtype=torch.float32)
-
-		probs = a2cActor(obs)
+		#action is not a pytorch tensor, but just an index
+		#action = env.action_space.sample()	
+	
+		#probs is 1D torch.tensor with n elements 
+		probs = a2cActor(obs_tensor)
+		
+		#dist is not a tensor, but a distribution object
 		dist = torch.distributions.Categorical(probs)
+		
+		#action is a pytorch scalar with value 0, 1, 2, ...
 		action = dist.sample()		
 
+		#log_prob is log of probability associated with selected softmax action / item 
+		#log_prob is a pytorch scalar	
 		log_probs.append(dist.log_prob(action))
 	
+		#reward is scalar => torch.tensor(reward); rewards is a list of scalars => torch.tensor(rewards)
 		obs_next, reward, terminated, truncated, info = env.step(action.item())
-		obs_next = torch.tensor(obs_next, dtype=torch.float32)
+		obs_next_tensor = torch.tensor(obs_next, dtype=torch.float32)
+		
 		done = terminated or truncated 
 		total_reward += reward
 
 		#actor
 		rewards.append(reward)
-		actions.append(action)
 
 		#critic
-		#with torch.no_grad():
-		value_next = a2cCritic(obs_next)
-		value = a2cCritic(obs)
+		value = a2cCritic(obs_tensor)
 
-		target = reward + (1 - done) * gamma * value_next
-		advantageLoss.append(target - value)
-		#detach() prevents gradients from propagating through 
+		#don't track gradients for any operations inside this block
+		with torch.no_grad():
+			#value_next is pure inference / no need to build computational graph 
+			value_next = a2cCritic(obs_next_tensor)
+			#target and advantage are treated as constants. there is no need to back propagate through them.  
+			#td(0) updates yield solutions with large biases, you are then bootstrapping on the biased result.
+			#this is visible, when the reinforce and a2c_td0 landings are compared side by side.   
+			target = torch.tensor(reward) + (1 - done) * gamma * value_next
+			#can also do (target - value).detach()
+			advantages.append(target - value)
+	 
+		#gradient is 2 * (target - value), for mse
+		#target is fixed.  However, you do want a gradient to flow back through value, since this is the critic's net.  
+		#i.e. value is a tensor output by the critic model.  backpropagate this: Value -> critic model parameters -> obs
 		critic_loss = (target - value).pow(2)
-		criticLoss.append(critic_loss)
+		critic_list.append(critic_loss)
 
-		obs = obs_next
-
-	#returns = compute_returns(rewards, gamma)
-	#returns = torch.tensor(returns, dtype=torch.float32)
-	#returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-	
-	actorLoss = []
-	#rPL = [-log_prob * G for log_prob, G in zip(log_probs, returns)]
+		obs_tensor = obs_next_tensor
 
 	for i in range(len(log_probs)):
 		log_prob = log_probs[i]
-		G = torch.tensor(advantageLoss[i], dtype=torch.float32) #returns[i]
-		actor_loss = -log_prob * G
-		actorLoss.append(actor_loss)
+		G = advantages[i]
+		policy_gradient = -log_prob * G
+		actor_list.append(policy_gradient)
 
-	a2cActor_loss = torch.stack(actorLoss, dim=0).mean()
+	#computational graph will back propagate the appropriate time step gradient updates for actor
+	#this is similar to reinforce. except now, we are subtracting a critic baseline to reduce the variance.  
+	a2cActor_estimate = torch.stack(actor_list, dim=0).mean()
 
 	optimA2CActor.zero_grad()
-	a2cActor_loss.backward()
+	a2cActor_estimate.backward()
 	optimA2CActor.step()
 
-	#criticLoss = torch.tensor(criticLoss, dtype=torch.float32)
-	#use stack so computational graph is not broken 
-	a2cCritic_loss = torch.stack(criticLoss).mean()
+	#computational graph will back propagate the appropriate time step gradient updates for critic
+	#gradient update is the gradient associated with mse_loss. 
+	a2cCritic_loss = torch.stack(critic_list, dim=0).mean()
 
 	optimA2CCritic.zero_grad()
 	a2cCritic_loss.backward()
 	optimA2CCritic.step()
 
-	print(f"Episode {episode}, reward_received {reward:.2f}, total reward {total_reward:.2f} criticLoss {a2cCritic_loss:.2f}")
+	print(f"Episode {episode}, reward_received {reward:.2f}, total reward {total_reward:.2f},  a2cActor_estimate {a2cActor_estimate:.5f}, a2cCritic_loss {a2cCritic_loss:.5f}")
 
 checkpoint = {
     "episode": episode,
