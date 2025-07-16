@@ -1,6 +1,7 @@
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 
 import torch
@@ -11,12 +12,11 @@ import torch.nn as nn
 #hyperparameters
 learning_rate = 1e-3
 latent_dim = 128
-epochs = 1000
+epochs = 100
 batch_size = 128
 
 
-
-#Load images
+#load images
 transform = transforms.ToTensor()
 training_dataset = torchvision.datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
 training_loader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True)
@@ -32,11 +32,11 @@ class Convolution_Variational_AutoEncoder(nn.Module):
 		
 		#kernel, stride, pad
 		self.encoder = nn.Sequential(
-			nn.Conv2d(3, 32, 4, 2, 1), 
+			nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1), 
 			nn.ReLU(),
-			nn.Conv2d(32, 64, 4, 2, 1),
+			nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
 			nn.ReLU(),
-			nn.Conv2d(64, 128, 4, 2, 1),
+			nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
 			nn.ReLU(),
 		)
 		#make 2D array one big, long vector 
@@ -49,11 +49,11 @@ class Convolution_Variational_AutoEncoder(nn.Module):
 
 		#reverse the process
 		self.decoder = nn.Sequential(
-			nn.ConvTranspose2d(128, 64, 4, 2, 1),
+			nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
 			nn.ReLU(),
-			nn.ConvTranspose2d(64, 32, 4, 2, 1),
+			nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
 			nn.ReLU(),
-			nn.ConvTranspose2d(32, 3, 4, 2, 1), 
+			nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1), 
 			nn.Sigmoid(),
 		)
 
@@ -86,10 +86,9 @@ class Convolution_Variational_AutoEncoder(nn.Module):
 
 
 
+#training loop
 cvaeModel = Convolution_Variational_AutoEncoder(latent_dim)
 optimizer = torch.optim.Adam(cvaeModel.parameters(), lr=learning_rate)
-
-
 
 for epoch in range(epochs):
 	total_loss = 0
@@ -101,17 +100,19 @@ for epoch in range(epochs):
 		#inherent blurry reconstruction result, due to vanilla mse_loss
 		reconstruct_loss = torch.nn.functional.mse_loss(imgs, reconstruct_images, reduction='sum')
 		#applying the known mathematical derivation 
-		kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-		
-		loss = reconstruct_loss + kl_loss
+		kl_divergence_term = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+	
+		#without kl_divergence_term, more of a true 1-1 reconstruction, since the distribution closeness 
+		#constraint is not enforced	
+		loss = reconstruct_loss + kl_divergence_term
 
 		optimizer.zero_grad()
 		loss.backward()
 		optimizer.step()
 
 		total_loss = total_loss + loss.item()
-	print(f"Epoch {epoch}, Loss R {reconstruct_loss}, Loss KL {kl_loss}, Loss {total_loss / len(training_loader.dataset)}")
 
+	print(f"Epoch {epoch}, Loss R {reconstruct_loss}, KL Divergence Term {kl_divergence_term}, Loss {total_loss / len(training_loader.dataset)}")
 
 	cvaeModel.eval()
 	with torch.no_grad():
@@ -124,10 +125,11 @@ for epoch in range(epochs):
 			plt.axis('off')
 
 			plt.subplot(2, 4, k + 1 + 4)
-			plt.imshow(reconstructed_images[k].permute(1, 2, 0))
-			plt.axis('off')
-			plt.pause(2)
-		plt.clf()
+
+	if epoch % 5  == 0:
+		save_image(imgs[0], f"cvae_orig_with_kl_epoch_{epoch}.png")
+		save_image(reconstructed_images[0], f"cvae_reconstruct_with_kl_epoch_{epoch}.png")
+
 
 with torch.no_grad():
 	imgs, _ = next(iter(training_loader))
